@@ -405,7 +405,8 @@ defmodule Consul.HTTP.Raw do
                       :proxy_auth,
                       :ssl,
                       :follow_redirect,
-                      :max_redirect]
+                      :max_redirect,
+                      :base_url]
 
   endpoints = endpoints.v1
   Enum.each(endpoints, fn(endpoint) ->
