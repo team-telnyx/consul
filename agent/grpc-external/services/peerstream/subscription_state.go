@@ -33,6 +33,11 @@ type subscriptionState struct {
 	// connectServices stores latest map of synthetic discovery chain replies.
 	connectServices map[structs.ServiceName]structs.ExportedDiscoveryChainInfo
 
+	// resendChains holds connectServices entries that are not in the
+	// exported-service-list and must be re-sent on the next sync even if
+	// their info is unchanged.
+	resendChains map[structs.ServiceName]struct{}
+
 	// eventVersions is a duplicate event suppression system keyed by the "id"
 	// not the "correlationID"
 	eventVersions map[string]string
@@ -54,6 +59,7 @@ func newSubscriptionState(peerName, partition string) *subscriptionState {
 		partition:       partition,
 		watchedServices: make(map[structs.ServiceName]context.CancelFunc),
 		connectServices: make(map[structs.ServiceName]structs.ExportedDiscoveryChainInfo),
+		resendChains:    make(map[structs.ServiceName]struct{}),
 		eventVersions:   make(map[string]string),
 	}
 }

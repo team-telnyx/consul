@@ -490,8 +490,11 @@ func (m *subscriptionManager) syncDiscoveryChains(
 	// if it was newly added, then try to emit an UPDATE event
 	for chainName, info := range chainsByName {
 		if oldInfo, ok := state.connectServices[chainName]; ok && info.Equal(oldInfo) {
-			continue
+			if _, resend := state.resendChains[chainName]; !resend {
+				continue
+			}
 		}
+		delete(state.resendChains, chainName)
 
 		state.connectServices[chainName] = info
 
@@ -505,16 +508,25 @@ func (m *subscriptionManager) syncDiscoveryChains(
 
 	// if it was dropped, try to emit an DELETE event
 	for chainName := range state.connectServices {
-		// Deleting stale peer state connect service entry not in exported-service-list
-		if _, ok := exportedServicesMap[chainName]; !ok {
-			delete(state.connectServices, chainName)
-		}
-
 		if _, ok := chainsByName[chainName]; ok {
+			// A chain that is still exported but not in the exported-service-list
+			// (a discovery-chain-only export, e.g. a service-resolver with no
+			// instances under a wildcard export) has its synthetic proxy pruned
+			// by the importer on every exported-service-list update, so it must
+			// be re-sent on the next sync (hashicorp/consul#23377). Mark it and
+			// forget its event version instead of dropping the entry: without
+			// the entry, removing the chain later never sends the DELETE below
+			// and importing peers keep a stale synthetic proxy pointing at this
+			// mesh gateway forever.
+			if _, ok := exportedServicesMap[chainName]; !ok {
+				state.resendChains[chainName] = struct{}{}
+				delete(state.eventVersions, discoveryChainPayloadIDPrefix+chainName.String())
+			}
 			continue
 		}
 
 		delete(state.connectServices, chainName)
+		delete(state.resendChains, chainName)
 
 		if state.meshGateway != nil {
 			// Only need to clean this up if we know we may have ever sent it in the first place.

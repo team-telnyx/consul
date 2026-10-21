@@ -601,6 +601,122 @@ func TestSubscriptionManager_InitialSnapshot(t *testing.T) {
 	})
 }
 
+// A discovery-chain-only service (a service-resolver with no instances) under a
+// wildcard export is in DiscoChains but not in the exported-service-list. When
+// the chain is later removed, the importing peer must still get a DELETE for its
+// synthetic sidecar proxy, even after exported-service-list updates in between
+// (regression from hashicorp/consul#23377, which dropped the chain from
+// connectServices on every sync so the DELETE was never sent).
+func TestSubscriptionManager_WildcardChainOnlyDelete(t *testing.T) {
+	backend := newTestSubscriptionBackend(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, id := backend.ensurePeering(t, "my-peering")
+	partition := acl.DefaultEnterpriseMeta().PartitionOrEmpty()
+
+	tracker := newResourceSubscriptionTracker()
+	tracker.Subscribe(pbpeerstream.TypeURLExportedService)
+
+	mgr := newSubscriptionManager(ctx, testutil.Logger(t), Config{
+		Datacenter:     "dc1",
+		ConnectEnabled: true,
+	}, connect.TestTrustDomain, backend, func() StateStore {
+		return backend.store
+	}, tracker)
+	subCh := mgr.subscribe(ctx, id, "my-peering", partition)
+
+	chainProxyCorrID := subExportedService + structs.NewServiceName("chain-sidecar-proxy", nil).String()
+
+	// waitFor drains events until each matcher has matched one, in any
+	// order, ignoring everything else.
+	type matcher struct {
+		desc  string
+		match func(cache.UpdateEvent) bool
+	}
+	waitFor := func(t *testing.T, matchers ...matcher) {
+		t.Helper()
+		pending := append([]matcher(nil), matchers...)
+		timeout := time.After(10 * time.Second)
+		for len(pending) > 0 {
+			select {
+			case <-timeout:
+				var descs []string
+				for _, m := range pending {
+					descs = append(descs, m.desc)
+				}
+				t.Fatalf("timed out waiting for %v", descs)
+			case evt := <-subCh:
+				for i, m := range pending {
+					if m.match(evt) {
+						pending = append(pending[:i], pending[i+1:]...)
+						break
+					}
+				}
+			}
+		}
+	}
+	chainProxyNodes := func(n int) func(cache.UpdateEvent) bool {
+		return func(evt cache.UpdateEvent) bool {
+			if evt.CorrelationID != chainProxyCorrID {
+				return false
+			}
+			return len(evt.Result.(*pbservice.IndexedCheckServiceNodes).Nodes) == n
+		}
+	}
+	exportedListHas := func(name string) func(cache.UpdateEvent) bool {
+		return func(evt cache.UpdateEvent) bool {
+			if evt.CorrelationID != subExportedServiceList {
+				return false
+			}
+			for _, s := range evt.Result.(*pbpeerstream.ExportedServiceList).Services {
+				if s == structs.NewServiceName(name, nil).String() {
+					return true
+				}
+			}
+			return false
+		}
+	}
+
+	backend.ensureNode(t, &structs.Node{Node: "mgw", Address: "10.1.1.1"})
+	backend.ensureService(t, "mgw", &structs.NodeService{ID: "gateway-1", Kind: structs.ServiceKindMeshGateway, Service: "gateway", Port: 8443})
+
+	backend.ensureConfigEntry(t, &structs.ServiceResolverConfigEntry{
+		Kind: structs.ServiceResolver,
+		Name: "chain",
+	})
+	backend.ensureConfigEntry(t, &structs.ExportedServicesConfigEntry{
+		Name: "default",
+		Services: []structs.ExportedService{
+			{
+				Name:      structs.WildcardSpecifier,
+				Consumers: []structs.ServiceConsumer{{Peer: "my-peering"}},
+			},
+		},
+	})
+
+	testutil.RunStep(t, "chain-only export sends a synthetic proxy", func(t *testing.T) {
+		waitFor(t, matcher{"chain-sidecar-proxy with 1 node", chainProxyNodes(1)})
+	})
+
+	testutil.RunStep(t, "exported-service-list update re-sends the synthetic proxy", func(t *testing.T) {
+		backend.ensureNode(t, &structs.Node{Node: "foo", Address: "10.0.0.1"})
+		backend.ensureService(t, "foo", &structs.NodeService{ID: "web-1", Service: "web", Port: 8080})
+
+		waitFor(t,
+			matcher{"exported-service-list with web", exportedListHas("web")},
+			matcher{"chain-sidecar-proxy re-sent with 1 node", chainProxyNodes(1)},
+		)
+	})
+
+	testutil.RunStep(t, "removing the chain deletes the synthetic proxy", func(t *testing.T) {
+		backend.deleteConfigEntry(t, structs.ServiceResolver, "chain")
+
+		waitFor(t, matcher{"chain-sidecar-proxy DELETE (0 nodes)", chainProxyNodes(0)})
+	})
+}
+
 func TestSubscriptionManager_CARoots(t *testing.T) {
 	backend := newTestSubscriptionBackend(t)
 
