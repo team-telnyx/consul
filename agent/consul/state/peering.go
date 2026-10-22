@@ -1005,6 +1005,37 @@ func exportedServicesForPeerTxn(
 		}
 	}
 
+	// Keep the Services list a consistent superset of the connect services
+	// streamed in DiscoChains.
+	//
+	// Under wildcard `Name:"*"` exports, discovery-chain config entries
+	// (service-resolver/router/splitter) are captured into
+	// exportedConnectServices regardless of instance presence: a chain
+	// exists for a service that currently has zero instances (a workload
+	// scaled to zero, or chain-only registrations such as catch-all
+	// materialized topologies). Emitting those names in DiscoChains while
+	// leaving them out of Services breaks the invariant that downstream
+	// consumers assume:
+	//
+	//   - the importing peer treats the Services field as the
+	//     authoritative exported set (peering ImportedServices);
+	//   - subscription bookkeeping reconciles connectServices state
+	//     against it; in particular hashicorp/consul#23377 prunes entries
+	//     absent from Services on the assumption that absence means "no
+	//     longer exported", which is false for chain-named entries.
+	//
+	// Including connect services here keeps both fields consistent within
+	// a single state-store read: a service stays listed while its chain
+	// config entry exists — even with zero instances — and is removed from
+	// both fields together when the chain config goes away, which is the
+	// only condition on which downstream GC (#23377's prune and the
+	// eventful delete path) should ever act.
+	for sn := range exportedConnectServices {
+		if _, ok := exportedServices[sn]; !ok {
+			exportedServices[sn] = struct{}{}
+		}
+	}
+
 	sortedServices := maps.SliceOfKeys(exportedServices)
 	structs.ServiceList(sortedServices).Sort()
 

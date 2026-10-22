@@ -2073,16 +2073,22 @@ func TestStateStore_ExportedServicesForPeer(t *testing.T) {
 		ws = memdb.NewWatchSet()
 
 		expect := &structs.ExportedServiceList{
-			// Only "billing" shows up, because there are no other service instances running,
-			// and "consul" is never exported.
+			// "billing" has instances; "mysql" is chain-only (resolver
+			// config entry, no instances) and is now exported consistently.
 			Services: []structs.ServiceName{
 				{
 					Name:           "billing",
 					EnterpriseMeta: *defaultEntMeta,
 				},
+				{
+					Name:           "mysql",
+					EnterpriseMeta: *defaultEntMeta,
+				},
 			},
-			// Only "mysql" appears because there it has a service resolver.
-			// "redis" does not appear, because it's a sidecar proxy without a corresponding service, so the wildcard doesn't find it.
+			// Only "mysql" appears as a disco chain because it has a
+			// service resolver. "redis" does not appear, because it's a
+			// sidecar proxy without a corresponding service, so the wildcard
+			// doesn't find it.
 			DiscoChains: map[structs.ServiceName]structs.ExportedDiscoveryChainInfo{
 				newSN("mysql"): {
 					Protocol: "tcp",
@@ -2174,7 +2180,23 @@ func TestStateStore_ExportedServicesForPeer(t *testing.T) {
 					EnterpriseMeta: *defaultEntMeta,
 				},
 				{
+					Name:           "mysql",
+					EnterpriseMeta: *defaultEntMeta,
+				},
+				{
 					Name:           "payments",
+					EnterpriseMeta: *defaultEntMeta,
+				},
+				{
+					Name:           "resolver",
+					EnterpriseMeta: *defaultEntMeta,
+				},
+				{
+					Name:           "router",
+					EnterpriseMeta: *defaultEntMeta,
+				},
+				{
+					Name:           "splitter",
 					EnterpriseMeta: *defaultEntMeta,
 				},
 				// NOTE: no payments-proxy here
@@ -2225,6 +2247,14 @@ func TestStateStore_ExportedServicesForPeer(t *testing.T) {
 					Name:           "payments",
 					EnterpriseMeta: *defaultEntMeta,
 				},
+				{
+					Name:           "resolver",
+					EnterpriseMeta: *defaultEntMeta,
+				},
+				{
+					Name:           "router",
+					EnterpriseMeta: *defaultEntMeta,
+				},
 				// NOTE: no payments-proxy here
 				// NOTE: no consul here
 			},
@@ -2242,6 +2272,88 @@ func TestStateStore_ExportedServicesForPeer(t *testing.T) {
 			},
 		}
 		idx, got, err := s.ExportedServicesForPeer(ws, id, "dc1")
+		require.NoError(t, err)
+		require.Equal(t, lastIdx, idx)
+		require.Equal(t, expect, got)
+	})
+
+	testutil.RunStep(t, "chain-only service with zero instances remains exported until its chain is removed", func(t *testing.T) {
+		// Regression guard for fleet incidents observed once workloads and
+		// catch-all materialized topologies introduce resolver entries
+		// with zero instances: without the union fix a chain-only service
+		// is present in DiscoChains but absent from Services, which
+		// membership-based bookkeeping downstream (hashicorp/consul#23377)
+		// interprets as "no longer exported" and silently destroys live
+		// streaming state. With the union fix the service stays listed
+		// while the chain config entry exists (a service scaled to zero
+		// included) and is removed from both fields together when the
+		// chain config is deleted.
+		ensureConfigEntry(t, &structs.ServiceResolverConfigEntry{
+			Kind:           structs.ServiceResolver,
+			Name:           "chainonly",
+			EnterpriseMeta: *defaultEntMeta,
+		})
+
+		require.True(t, watchFired(ws))
+		ws = memdb.NewWatchSet()
+
+		// No catalog instances exist for "chainonly", yet it must be
+		// exported consistently while its resolver entry exists.
+		expect := &structs.ExportedServiceList{
+			Services: []structs.ServiceName{
+				newSN("chainonly"),
+				newSN("payments"),
+				newSN("resolver"),
+				newSN("router"),
+			},
+			DiscoChains: map[structs.ServiceName]structs.ExportedDiscoveryChainInfo{
+				newSN("chainonly"): {
+					Protocol: "http",
+				},
+				newSN("payments"): {
+					Protocol: "http",
+				},
+				newSN("resolver"): {
+					Protocol: "http",
+				},
+				newSN("router"): {
+					Protocol: "http",
+				},
+			},
+		}
+		idx, got, err := s.ExportedServicesForPeer(ws, id, "dc1")
+		require.NoError(t, err)
+		require.Equal(t, lastIdx, idx)
+		require.Equal(t, expect, got)
+
+		// Removing the chain config entry removes the service from both
+		// fields in the same snapshot — the only condition under which
+		// downstream GC (#23377's prune included) should act.
+		lastIdx++
+		require.NoError(t, s.DeleteConfigEntry(lastIdx, structs.ServiceResolver, "chainonly", nil))
+
+		require.True(t, watchFired(ws))
+		ws = memdb.NewWatchSet()
+
+		expect = &structs.ExportedServiceList{
+			Services: []structs.ServiceName{
+				newSN("payments"),
+				newSN("resolver"),
+				newSN("router"),
+			},
+			DiscoChains: map[structs.ServiceName]structs.ExportedDiscoveryChainInfo{
+				newSN("payments"): {
+					Protocol: "http",
+				},
+				newSN("resolver"): {
+					Protocol: "http",
+				},
+				newSN("router"): {
+					Protocol: "http",
+				},
+			},
+		}
+		idx, got, err = s.ExportedServicesForPeer(ws, id, "dc1")
 		require.NoError(t, err)
 		require.Equal(t, lastIdx, idx)
 		require.Equal(t, expect, got)
@@ -2269,6 +2381,8 @@ func TestStateStore_ExportedServicesForPeer(t *testing.T) {
 		expect := &structs.ExportedServiceList{
 			Services: []structs.ServiceName{
 				newSN("payments"),
+				newSN("resolver"),
+				newSN("router"),
 				newSN("term-svc"),
 			},
 			DiscoChains: map[structs.ServiceName]structs.ExportedDiscoveryChainInfo{
