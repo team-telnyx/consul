@@ -487,46 +487,47 @@ func (m *subscriptionManager) syncDiscoveryChains(
 	pending *pendingPayload,
 	chainsByName map[structs.ServiceName]structs.ExportedDiscoveryChainInfo,
 ) {
+	// Only announce discovery chains whose service is also in the
+	// exported-service-list. Under a wildcard export, a chain-only service (a
+	// service-resolver/router/splitter with no instances here) is in
+	// DiscoChains but not in that list, and:
+	//   - this DC's mesh gateway refuses it anyway (MeshGatewayValidExportedServices
+	//     skips unregistered services), so peers that pick it as a failover
+	//     target get their connections reset;
+	//   - the importer prunes its synthetic proxy on every exported-service-list
+	//     update, which is why hashicorp/consul#23377 started re-sending it, at
+	//     the cost of never sending the DELETE once the chain is removed.
+	// When the service gains instances it joins the list and is announced
+	// (the scale-up case #23377 was after); when it loses them it is retracted.
+	exportedServicesMap := make(map[structs.ServiceName]struct{}, len(state.exportList.Services))
+	for _, sn := range state.exportList.Services {
+		exportedServicesMap[sn] = struct{}{}
+	}
+
 	// if it was newly added, then try to emit an UPDATE event
 	for chainName, info := range chainsByName {
-		if oldInfo, ok := state.connectServices[chainName]; ok && info.Equal(oldInfo) {
-			if _, resend := state.resendChains[chainName]; !resend {
-				continue
-			}
+		if _, ok := exportedServicesMap[chainName]; !ok {
+			continue
 		}
-		delete(state.resendChains, chainName)
+
+		if oldInfo, ok := state.connectServices[chainName]; ok && info.Equal(oldInfo) {
+			continue
+		}
 
 		state.connectServices[chainName] = info
 
 		m.collectPendingEventForDiscoveryChain(state, pending, chainName, info)
 	}
 
-	exportedServicesMap := make(map[structs.ServiceName]struct{}, len(state.exportList.Services))
-	for _, m := range state.exportList.Services {
-		exportedServicesMap[m] = struct{}{}
-	}
-
-	// if it was dropped, try to emit an DELETE event
+	// if it was dropped or is no longer announced, try to emit an DELETE event
 	for chainName := range state.connectServices {
 		if _, ok := chainsByName[chainName]; ok {
-			// A chain that is still exported but not in the exported-service-list
-			// (a discovery-chain-only export, e.g. a service-resolver with no
-			// instances under a wildcard export) has its synthetic proxy pruned
-			// by the importer on every exported-service-list update, so it must
-			// be re-sent on the next sync (hashicorp/consul#23377). Mark it and
-			// forget its event version instead of dropping the entry: without
-			// the entry, removing the chain later never sends the DELETE below
-			// and importing peers keep a stale synthetic proxy pointing at this
-			// mesh gateway forever.
-			if _, ok := exportedServicesMap[chainName]; !ok {
-				state.resendChains[chainName] = struct{}{}
-				delete(state.eventVersions, discoveryChainPayloadIDPrefix+chainName.String())
+			if _, ok := exportedServicesMap[chainName]; ok {
+				continue
 			}
-			continue
 		}
 
 		delete(state.connectServices, chainName)
-		delete(state.resendChains, chainName)
 
 		if state.meshGateway != nil {
 			// Only need to clean this up if we know we may have ever sent it in the first place.
